@@ -504,18 +504,46 @@ def eval_kfold(
 # Test pairs CSV reader
 # ----------------------------
 def read_test_pairs_csv(path: str) -> List[str]:
+    """
+    Robustly read test pairs from CSV.
+
+    Accepts:
+      - A single column with NO header, e.g. first line is 'g0001+g0002'
+      - A single column WITH header named 'perturbation'
+      - A single column WITH an accidental "header" that is itself a valid pair
+        (e.g., 'g0037+g0083'), which pandas would otherwise swallow as the column name.
+
+    Returns a list of normalized 'g####+g####|ctrl' strings, preserving order.
+    """
+    # Read once with default header behavior
     df = pd.read_csv(path)
+
+    # Choose the series to read
     if "perturbation" in df.columns:
-        col = df["perturbation"]
+        series = df["perturbation"].astype(str)
+        header_candidate = None  # normal, explicit header
     else:
-        col = df[df.columns[0]]
-    pairs = []
-    for v in col.astype(str).tolist():
+        # Take first column; remember its *column name* in case it's a valid pair
+        first_col_name = str(df.columns[0]) if len(df.columns) > 0 else ""
+        series = df.iloc[:, 0].astype(str) if len(df.columns) > 0 else pd.Series([], dtype=str)
+        header_candidate = first_col_name.strip()
+
+    pairs: List[str] = []
+
+    # If the "column name" itself looks like a valid pair, prepend it.
+    # This fixes the case where pandas swallowed the first data row as a header.
+    if header_candidate and PAIR_RE.match(header_candidate):
+        pairs.append(header_candidate)
+
+    # Now add the actual column values
+    for v in series.tolist():
         v = v.strip()
         if not v:
             continue
-        _ = parse_pair(v)  # validate
+        # validate format; this will raise early if something is malformed
+        _ = parse_pair(v)
         pairs.append(v)
+
     return pairs
 
 # ----------------------------
