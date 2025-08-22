@@ -2,17 +2,23 @@
 # -*- coding: utf-8 -*-
 
 """
-Train simple models to predict double-perturbation expression profiles from singles,
-with:
-  - noise-robust baselines (trimmed-median control, winsorization)
-  - compact, symmetric feature sets (basic or expanded)
-  - per-gene adaptive ensembling (learned blend of additive and ridge)
-  - optional scaled-additive baseline (global or per-gene alpha)
-  - k-fold evaluation (logs RMSD for additive, ridge, ensemble, adaptive)
-  - per-PAIR and per-GENE RMSD logs
-  - a compact summary metrics CSV (--metrics_csv) for quick reading/plotting
-  - support for test_pairs as CSV
-  - switchable modes: eval (k-fold) vs predict (write prediction/prediction.csv)
+Predict double-perturbation expression from singles with robust baselines,
+compact symmetric features, optional adaptive/ridge ensemble, and
+a lightweight residual learner to capture non-additive effects.
+
+Layout:
+  - Train matrix: data/train_matrix.csv  (rows=genes, cols=perturbations; index=gene id)
+  - Test pairs:   data/test_pairs.csv    (single column of 'g####+g####' or 'g####+ctrl')
+  - Output:       prediction/prediction.csv
+
+Modes:
+  --mode eval     : k-fold CV across observed doubles, logs RMSD (add/ridge/ens/adapt/resid)
+  --mode predict  : write prediction/prediction.csv for pairs in data/test_pairs.csv
+
+New extras:
+  - Global pair features (cosine similarity, norms, dot) to flag synergy/antagonism
+  - Residual learner (HistGradientBoostingRegressor) to correct additive/ensemble
+  - Robust test_pairs reader (recovers first-row-as-header)
 """
 
 import argparse
@@ -25,6 +31,8 @@ import pandas as pd
 from sklearn.linear_model import RidgeCV
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_squared_error
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.preprocessing import StandardScaler
 
 PAIR_RE = re.compile(r"^(g\d{4})\+(g\d{4}|ctrl)$", re.IGNORECASE)
 
@@ -33,56 +41,45 @@ PAIR_RE = re.compile(r"^(g\d{4})\+(g\d{4}|ctrl)$", re.IGNORECASE)
 # ----------------------------
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["eval", "predict"], required=True,
-                    help="'eval' = k-fold CV on observed doubles; 'predict' = generate prediction.csv for provided pairs")
-    ap.add_argument("--train_csv", required=True,
-                    help="Matrix CSV (rows=genes, cols=perturbations). Index col=gene id.")
-    ap.add_argument("--test_pairs", default=None,
-                    help="CSV file containing test pairs. If omitted in 'predict' mode, will error. "
-                         "Accepted columns: 'perturbation' or first column.")
-    ap.add_argument("--out_csv", default="prediction/prediction.csv",
-                    help="Output path for predictions in predict mode.")
-    ap.add_argument("--template_csv", default=None,
-                    help="Optional 3-col template (gene, perturbation, expression) to copy row order from")
+    ap.add_argument("--mode", choices=["eval", "predict"], required=True)
+    ap.add_argument("--train_csv", default="data/train_matrix.csv")
+    ap.add_argument("--test_pairs", default="data/test_pairs.csv")
+    ap.add_argument("--out_csv", default="prediction/prediction.csv")
+    ap.add_argument("--template_csv", default=None)
 
     # Models and features
-    ap.add_argument("--no_ridge", action="store_true",
-                    help="Skip per-gene ridge; use additive baseline only")
-    ap.add_argument("--ridge_alphas", default="0.01,0.1,1.0,10.0",
-                    help="Comma list for RidgeCV alphas")
-    ap.add_argument("--ensemble_weight", type=float, default=0.5,
-                    help="Weight on ridge in [0,1]; (1-w) on additive (used when --adaptive_ensemble is OFF)")
-    ap.add_argument("--features", choices=["basic","expanded"], default="basic",
-                    help="Feature set for ridge. basic: 7 feats; expanded: adds min/max/quadratics.")
+    ap.add_argument("--no_ridge", action="store_true")
+    ap.add_argument("--ridge_alphas", default="0.01,0.1,1.0,10.0")
+    ap.add_argument("--ensemble_weight", type=float, default=0.5)
+    ap.add_argument("--features", choices=["basic","expanded"], default="expanded")
 
-    # Scaled additive options
-    ap.add_argument("--scaled_additive", choices=["none","global","per_gene"], default="none",
-                    help="If enabled, fit alpha so y = alpha*(add) + (1-alpha)*ctrl. Fit on training folds (eval) or all doubles (predict).")
-    ap.add_argument("--alpha_clip", type=float, default=1.0,
-                    help="Clip |alpha| <= alpha_clip (default 1.0).")
-
-    # Adaptive ensembling options
-    ap.add_argument("--adaptive_ensemble", action="store_true",
-                    help="Learn per-gene weights to blend additive and ridge on training doubles.")
+    # Scaled additive & adaptive blend
+    ap.add_argument("--scaled_additive", choices=["none","global","per_gene"], default="none")
+    ap.add_argument("--alpha_clip", type=float, default=1.0)
+    ap.add_argument("--adaptive_ensemble", action="store_true")
 
     # Robust baseline options
-    ap.add_argument("--robust_ctrl", action="store_true",
-                    help="Use trimmed-median across singles as control instead of median.")
-    ap.add_argument("--trim_pct", type=float, default=0.10,
-                    help="Trim proportion per tail for trimmed-median control (e.g., 0.10 = 10%).")
-    ap.add_argument("--winsorize_pct", type=float, default=0.00,
-                    help="Winsorize singles per-gene at this two-tailed percent (e.g., 0.01). 0 disables.")
+    ap.add_argument("--robust_ctrl", action="store_true")
+    ap.add_argument("--trim_pct", type=float, default=0.10)
+    ap.add_argument("--winsorize_pct", type=float, default=0.00)
+
+    # Residual learner (small non-linear correction)
+    ap.add_argument("--residual_learner", choices=["none","hgb"], default="hgb",
+                    help="Learn residual y_true - y_base from pair+gene features.")
+    ap.add_argument("--resid_on", choices=["additive","ensemble"], default="ensemble",
+                    help="Which base to correct with residual learner.")
+    ap.add_argument("--resid_max_depth", type=int, default=3)
+    ap.add_argument("--resid_learning_rate", type=float, default=0.05)
+    ap.add_argument("--resid_max_iter", type=int, default=300)
+    ap.add_argument("--resid_min_samples_leaf", type=int, default=20,
+                    help="Min samples per leaf for HGB residual models.")
 
     # Eval logging
-    ap.add_argument("--k_folds", type=int, default=5,
-                    help="Number of folds for eval mode")
-    ap.add_argument("--metrics_csv", default="metrics/eval_metrics.csv",
-                    help="Summary metrics CSV (overall & per-fold means) in eval mode")
-    ap.add_argument("--metrics_per_pair_csv", default="metrics/metrics_per_pair.csv",
-                    help="Where to write per-pair eval metrics CSV (eval mode)")
-    ap.add_argument("--metrics_per_gene_csv", default="metrics/metrics_per_gene.csv",
-                    help="Where to write per-gene eval metrics CSV (eval mode)")
-    ap.add_argument("--seed", type=int, default=42, help="Random seed for KFold shuffling")
+    ap.add_argument("--k_folds", type=int, default=5)
+    ap.add_argument("--metrics_csv", default="metrics/eval_metrics.csv")
+    ap.add_argument("--metrics_per_pair_csv", default="metrics/metrics_per_pair.csv")
+    ap.add_argument("--metrics_per_gene_csv", default="metrics/metrics_per_gene.csv")
+    ap.add_argument("--seed", type=int, default=42)
     return ap.parse_args()
 
 # ----------------------------
@@ -101,19 +98,18 @@ def parse_pair(pair: str) -> Tuple[str, str]:
     m = PAIR_RE.match(pair)
     if not m:
         raise ValueError(f"Bad pair format: {pair}")
-    a, b = m.group(1), m.group(2)
-    return (a, b)
+    return (m.group(1), m.group(2))
 
 def load_matrix(csv_path: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path, index_col=0)
     df.columns = [c.strip() for c in df.columns]
     df.index = [i.strip() for i in df.index]
+    # de-duplicate columns by averaging if necessary
     if len(df.columns) != len(set(df.columns)):
         df = df.groupby(axis=1, level=0).mean()
     return df
 
 def winsorize_singles(singles: Dict[str, np.ndarray], pct: float) -> Dict[str, np.ndarray]:
-    """Winsorize per gene across singles; returns new dict."""
     if pct <= 0:
         return singles
     keys = list(singles.keys())
@@ -127,8 +123,7 @@ def winsorize_singles(singles: Dict[str, np.ndarray], pct: float) -> Dict[str, n
     return out
 
 def trimmed_median_ctrl(singles: Dict[str, np.ndarray], trim_pct: float) -> np.ndarray:
-    """Per-gene trimmed median across singles."""
-    S = np.stack(list(singles.values()), axis=1)  # [genes, num_singles]
+    S = np.stack(list(singles.values()), axis=1)
     if trim_pct <= 0 or S.shape[1] < 4:
         return np.median(S, axis=1)
     lo_q = 100 * trim_pct
@@ -153,10 +148,9 @@ def find_ctrl_vector(df: pd.DataFrame, singles: Dict[str, np.ndarray],
         return df[ctrl_cols[0]].values.astype(float)
     if len(singles) == 0:
         raise RuntimeError("No singles found; cannot derive control.")
-    if robust_ctrl:
-        return trimmed_median_ctrl(singles, trim_pct)
-    S = np.stack(list(singles.values()), axis=1)
-    return np.median(S, axis=1)
+    return trimmed_median_ctrl(singles, trim_pct) if robust_ctrl else np.median(
+        np.stack(list(singles.values()), axis=1), axis=1
+    )
 
 def build_training_pairs(df: pd.DataFrame) -> List[Tuple[str, str, np.ndarray]]:
     pairs = []
@@ -189,15 +183,23 @@ def make_feature_vector(ea: float, eb: float, e0: float, expanded: bool) -> np.n
 def num_features(expanded: bool) -> int:
     return 12 if expanded else 7
 
+def pair_global_features(ea_vec: np.ndarray, eb_vec: np.ndarray) -> np.ndarray:
+    """
+    Global pair stats across the whole transcriptome: cosine similarity, norms, dot product.
+    Same values are used for all target genes in the pair.
+    """
+    a = ea_vec; b = eb_vec
+    na = float(np.linalg.norm(a) + 1e-12)
+    nb = float(np.linalg.norm(b) + 1e-12)
+    dot = float(np.dot(a, b))
+    cos = float(dot / (na * nb))
+    return np.array([cos, na, nb, dot], dtype=float)
+
 # ----------------------------
 # Scaled additive & adaptive weights
 # ----------------------------
 def fit_scaled_additive_alpha(y_add: np.ndarray, y_true: np.ndarray, ctrl_vec: np.ndarray,
                               mode: str, alpha_clip: float) -> np.ndarray:
-    """
-    Fit alpha so y ≈ alpha*(add) + (1-alpha)*ctrl.
-    mode: 'global' returns scalar alpha broadcasted; 'per_gene' returns vector per gene.
-    """
     add_minus_ctrl = y_add - ctrl_vec
     if mode == "global":
         num = np.dot(add_minus_ctrl, (y_true - ctrl_vec))
@@ -205,7 +207,6 @@ def fit_scaled_additive_alpha(y_add: np.ndarray, y_true: np.ndarray, ctrl_vec: n
         alpha = np.clip(num / den, -alpha_clip, alpha_clip)
         return np.full_like(ctrl_vec, alpha, dtype=float)
     else:
-        # per_gene
         num = add_minus_ctrl * (y_true - ctrl_vec)
         den = add_minus_ctrl * add_minus_ctrl + 1e-12
         alpha = np.clip(num / den, -alpha_clip, alpha_clip)
@@ -220,17 +221,11 @@ def apply_scaled_additive(ea_vec: np.ndarray, eb_vec: np.ndarray, ctrl_vec: np.n
     return np.clip(y, 0.0, None)
 
 def fit_per_gene_adaptive_weights(y_add_M: np.ndarray, y_ridge_M: np.ndarray, y_true_M: np.ndarray) -> np.ndarray:
-    """
-    Closed-form per-gene optimal w in y ≈ (1-w)*y_add + w*y_ridge minimizing MSE over columns/samples.
-    Inputs are matrices [genes, samples].
-    Returns w per gene in [0,1].
-    """
     D = y_ridge_M - y_add_M
     num = np.sum(D * (y_true_M - y_add_M), axis=1)
     den = np.sum(D * D, axis=1) + 1e-12
     w = num / den
-    w = np.clip(w, 0.0, 1.0)
-    return w
+    return np.clip(w, 0.0, 1.0)
 
 # ----------------------------
 # Modeling
@@ -280,12 +275,8 @@ def additive_prediction(
     alpha_vec: Optional[np.ndarray] = None
 ) -> np.ndarray:
     a, b = pair
-    ea = singles.get(a)
-    eb = singles.get(b)
-    if ea is None:
-        ea = ctrl_vec
-    if eb is None:
-        eb = ctrl_vec
+    ea = singles.get(a, ctrl_vec)
+    eb = singles.get(b, ctrl_vec)
     return apply_scaled_additive(ea, eb, ctrl_vec, alpha_vec)
 
 def ridge_prediction_for_pair(
@@ -296,17 +287,109 @@ def ridge_prediction_for_pair(
     expanded_features: bool
 ) -> np.ndarray:
     a, b = pair
-    ea_vec = singles.get(a)
-    eb_vec = singles.get(b)
-    if ea_vec is None:
-        ea_vec = ctrl_vec
-    if eb_vec is None:
-        eb_vec = ctrl_vec
+    ea_vec = singles.get(a, ctrl_vec)
+    eb_vec = singles.get(b, ctrl_vec)
 
     y = np.zeros_like(ctrl_vec, dtype=float)
     for i in range(len(ctrl_vec)):
         fv = make_feature_vector(float(ea_vec[i]), float(eb_vec[i]), float(ctrl_vec[i]), expanded_features)
         y[i] = float(np.dot(coefs[i, :], fv))
+    return np.clip(y, 0.0, None)
+
+# ----------------------------
+# Residual learner
+# ----------------------------
+def build_pair_gene_features(ea_vec: np.ndarray, eb_vec: np.ndarray,
+                             ctrl_val: float,
+                             ea: float, eb: float, expanded: bool) -> np.ndarray:
+    """Concatenate per-gene compact features with global pair features."""
+    f_gene = make_feature_vector(ea, eb, float(ctrl_val), expanded)  # per-gene features
+    f_pair = pair_global_features(ea_vec, eb_vec)                    # same for all genes in the pair
+    return np.concatenate([f_gene, f_pair], axis=0)
+
+def train_residual_models(
+    df: pd.DataFrame,
+    singles: Dict[str, np.ndarray],
+    ctrl_vec: np.ndarray,
+    base_on: str,
+    coefs: Optional[np.ndarray],
+    expanded_features: bool,
+    alphas: List[float],
+    train_pair_indices: List[int],
+    resid_params: dict,
+    random_state: int
+):
+    """
+    Train a small HGBR per-gene to predict residuals (y_true - y_base).
+    base_on: 'additive' or 'ensemble' (if ensemble, a ridge must be available)
+    Returns list of (scaler, model) per gene (or (None,None) if insufficient data).
+    """
+    all_pairs = build_training_pairs(df)
+    genes = list(df.index)
+    gN = len(genes)
+    models = [None] * gN
+    scalers = [None] * gN
+
+    if base_on == "ensemble" and coefs is None:
+        raise ValueError("Residual base 'ensemble' requires ridge coefficients.")
+
+    for i_g in range(gN):
+        Xg = []
+        yg = []
+        for idx in train_pair_indices:
+            a, b, y_true = all_pairs[idx]
+            ea_vec = singles.get(a, ctrl_vec)
+            eb_vec = singles.get(b, ctrl_vec)
+            # base predictions
+            y_add = additive_prediction(singles, ctrl_vec, (a,b), alpha_vec=None)
+            if base_on == "additive":
+                y_base = y_add
+            else:
+                y_ridge = ridge_prediction_for_pair(singles, ctrl_vec, (a,b), coefs, expanded_features)
+                y_base = 0.5 * (y_add + y_ridge)  # neutral blend during residual training
+
+            resid = float(y_true[i_g] - y_base[i_g])
+            f = build_pair_gene_features(ea_vec, eb_vec, ctrl_vec[i_g], float(ea_vec[i_g]), float(eb_vec[i_g]), expanded_features)
+            Xg.append(f); yg.append(resid)
+
+        if len(Xg) >= 20:  # need enough doubles to train non-linear model
+            Xg = np.vstack(Xg); yg = np.array(yg)
+            scaler = StandardScaler()
+            Xg = scaler.fit_transform(Xg)
+            model = HistGradientBoostingRegressor(
+                max_depth=resid_params.get("max_depth", 3),
+                learning_rate=resid_params.get("learning_rate", 0.05),
+                max_iter=resid_params.get("max_iter", 300),
+                min_samples_leaf=resid_params.get("min_samples_leaf", 20),
+                random_state=random_state
+            )
+            model.fit(Xg, yg)
+            models[i_g] = model
+            scalers[i_g] = scaler
+        else:
+            models[i_g] = None
+            scalers[i_g] = None
+
+    return scalers, models
+
+def predict_with_residual(
+    singles: Dict[str, np.ndarray],
+    ctrl_vec: np.ndarray,
+    pair: Tuple[str, str],
+    base_pred: np.ndarray,
+    expanded_features: bool,
+    scalers, models
+) -> np.ndarray:
+    a, b = pair
+    ea_vec = singles.get(a, ctrl_vec)
+    eb_vec = singles.get(b, ctrl_vec)
+    y = base_pred.copy()
+    for i in range(len(ctrl_vec)):
+        f = build_pair_gene_features(ea_vec, eb_vec, ctrl_vec[i], float(ea_vec[i]), float(eb_vec[i]), expanded_features)
+        sc = scalers[i]; md = models[i]
+        if md is not None and sc is not None:
+            fv = sc.transform(f.reshape(1,-1))
+            y[i] += float(md.predict(fv)[0])
     return np.clip(y, 0.0, None)
 
 # ----------------------------
@@ -326,16 +409,19 @@ def eval_kfold(
     expanded_features: bool,
     scaled_additive_mode: str,
     alpha_clip: float,
-    adaptive_ensemble: bool
+    adaptive_ensemble: bool,
+    residual_learner: str,
+    resid_on: str,
+    resid_params: dict
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     genes = list(df.index)
     all_pairs = build_training_pairs(df)
 
-    # Preprocess singles (winsorize if requested)
+    # Preprocess singles
     singles = winsorize_singles(singles_in, winsorize_pct)
     ctrl_vec = find_ctrl_vector(df, singles, robust_ctrl, trim_pct)
 
-    # Keep only doubles whose singles exist
+    # Keep only doubles with both singles present
     usable_idx = []
     for i, (a, b, _y) in enumerate(all_pairs):
         if singles.get(a) is not None and singles.get(b) is not None:
@@ -365,24 +451,17 @@ def eval_kfold(
         # ----- Fit scaled-additive alpha on training folds -----
         alpha_vec = None
         if scaled_additive_mode != "none":
-            # Build training matrices for alpha fit
-            train_pairs = [all_pairs[i] for i in train_idx_abs]
-            # Use a pooled approach: concatenate samples for stable fit
             y_add_cols, y_true_cols = [], []
-            for a,b,y_true in train_pairs:
-                y_add = additive_prediction(singles, ctrl_vec, (a,b), alpha_vec=None)  # base (alpha None)
-                y_add_cols.append(y_add)
+            for a,b,y_true in [all_pairs[i] for i in train_idx_abs]:
+                y_add_cols.append(additive_prediction(singles, ctrl_vec, (a,b), alpha_vec=None))
                 y_true_cols.append(y_true)
-            y_add_M = np.stack(y_add_cols, axis=1)   # [genes, samples]
-            y_true_M = np.stack(y_true_cols, axis=1) # [genes, samples]
-            # Fit alpha per-gene or global
+            y_add_M = np.stack(y_add_cols, axis=1)
+            y_true_M = np.stack(y_true_cols, axis=1)
             if scaled_additive_mode == "global":
-                # flatten
                 alpha_vec = fit_scaled_additive_alpha(y_add_M.flatten(), y_true_M.flatten(),
                                                       np.tile(ctrl_vec, y_add_M.shape[1]),
                                                       mode="global", alpha_clip=alpha_clip)
             else:
-                # per-gene using means across samples
                 alpha_vec = fit_scaled_additive_alpha(np.mean(y_add_M, axis=1),
                                                       np.mean(y_true_M, axis=1),
                                                       ctrl_vec, mode="per_gene", alpha_clip=alpha_clip)
@@ -394,13 +473,22 @@ def eval_kfold(
             for a,b,y_true in [all_pairs[i] for i in train_idx_abs]:
                 y_add = additive_prediction(singles, ctrl_vec, (a,b), alpha_vec)
                 y_ridge = ridge_prediction_for_pair(singles, ctrl_vec, (a,b), coefs, expanded_features)
-                y_add_cols.append(y_add)
-                y_ridge_cols.append(y_ridge)
-                y_true_cols.append(y_true)
+                y_add_cols.append(y_add); y_ridge_cols.append(y_ridge); y_true_cols.append(y_true)
             y_add_M = np.stack(y_add_cols, axis=1)
             y_ridge_M = np.stack(y_ridge_cols, axis=1)
             y_true_M = np.stack(y_true_cols, axis=1)
-            w_adapt = fit_per_gene_adaptive_weights(y_add_M, y_ridge_M, y_true_M)  # [genes]
+            w_adapt = fit_per_gene_adaptive_weights(y_add_M, y_ridge_M, y_true_M)
+
+        # ----- Residual models on training folds (optional) -----
+        scalers = models = None
+        if residual_learner != "none":
+            base_on = resid_on
+            scalers, models = train_residual_models(
+                df, singles, ctrl_vec, base_on=base_on, coefs=coefs,
+                expanded_features=expanded_features, alphas=alphas,
+                train_pair_indices=train_idx_abs,
+                resid_params=resid_params, random_state=seed
+            )
 
         # Per-gene accumulators for this fold
         gN = len(genes)
@@ -408,13 +496,12 @@ def eval_kfold(
         sse_ridge = np.zeros(gN, dtype=float)
         sse_ens = np.zeros(gN, dtype=float)
         sse_adapt = np.zeros(gN, dtype=float)
+        sse_resid = np.zeros(gN, dtype=float)
         counts = np.zeros(gN, dtype=int)
 
         # Evaluate on held-out fold pairs
-        for idx_abs in test_idx_rel:
-            # Note: idx_abs is relative to usable_idx; convert to absolute
-            idx_abs_true = usable_idx[idx_abs]
-            a, b, y_true = all_pairs[idx_abs_true]
+        for idx_abs in test_idx_abs:
+            a, b, y_true = all_pairs[idx_abs]
             pair_name = f"{a}+{b}"
 
             y_add = additive_prediction(singles, ctrl_vec, (a, b), alpha_vec)
@@ -422,24 +509,28 @@ def eval_kfold(
 
             if use_ridge:
                 y_ridge = ridge_prediction_for_pair(singles, ctrl_vec, (a, b), coefs, expanded_features)
+                y_ens = np.clip((1.0 - ensemble_weight) * y_add + ensemble_weight * y_ridge, 0.0, None)
                 rmsd_ridge = mean_squared_error(y_true, y_ridge, squared=False)
-                # fixed global-weight ensemble for continuity
-                y_ens = (1.0 - ensemble_weight) * y_add + ensemble_weight * y_ridge
-                y_ens = np.clip(y_ens, 0.0, None)
                 rmsd_ens = mean_squared_error(y_true, y_ens, squared=False)
             else:
-                y_ridge = y_add
-                rmsd_ridge = None
-                y_ens = y_add
-                rmsd_ens = rmsd_add
+                y_ridge = y_add; y_ens = y_add
+                rmsd_ridge = None; rmsd_ens = rmsd_add
 
             # adaptive per-gene
             if adaptive_ensemble and use_ridge and w_adapt is not None:
                 y_adapt = np.clip((1.0 - w_adapt) * y_add + w_adapt * y_ridge, 0.0, None)
                 rmsd_adapt = mean_squared_error(y_true, y_adapt, squared=False)
             else:
-                y_adapt = y_ens
-                rmsd_adapt = rmsd_ens
+                y_adapt = y_ens; rmsd_adapt = rmsd_ens
+
+            # residual correction (optional)
+            if residual_learner != "none" and models is not None:
+                base_for_resid = y_add if resid_on == "additive" else y_ens
+                y_resid = predict_with_residual(singles, ctrl_vec, (a,b), base_for_resid,
+                                                expanded_features, scalers, models)
+                rmsd_resid = mean_squared_error(y_true, y_resid, squared=False)
+            else:
+                y_resid = y_adapt; rmsd_resid = rmsd_adapt
 
             rows_pair.append({
                 "fold": fold_id,
@@ -447,103 +538,79 @@ def eval_kfold(
                 "rmsd_additive": rmsd_add,
                 "rmsd_ridge": rmsd_ridge,
                 "rmsd_ensemble": rmsd_ens,
-                "rmsd_adaptive": rmsd_adapt if adaptive_ensemble and use_ridge else None
+                "rmsd_adaptive": rmsd_adapt if adaptive_ensemble and use_ridge else None,
+                "rmsd_residual": rmsd_resid if residual_learner != "none" else None
             })
 
             # accumulate per-gene SSE
             sse_add += (y_add - y_true) ** 2
-            sse_ens += (y_ens - y_true) ** 2
-            if adaptive_ensemble and use_ridge:
-                sse_adapt += (y_adapt - y_true) ** 2
-            if use_ridge:
-                sse_ridge += (y_ridge - y_true) ** 2
+            if use_ridge: sse_ridge += (y_ridge - y_true) ** 2
+            sse_ens  += (y_ens  - y_true) ** 2
+            if adaptive_ensemble and use_ridge: sse_adapt += (y_adapt - y_true) ** 2
+            if residual_learner != "none": sse_resid += (y_resid - y_true) ** 2
             counts += 1
 
-        # fold-level per-gene RMSD (avg over pairs)
+        # fold-level per-gene RMSD
         mask = counts > 0
-        rmsd_add_gene = np.zeros_like(sse_add); rmsd_add_gene[mask] = np.sqrt(sse_add[mask] / counts[mask])
-        rmsd_ens_gene = np.zeros_like(sse_add); rmsd_ens_gene[mask] = np.sqrt(sse_ens[mask] / counts[mask])
-        if adaptive_ensemble and use_ridge:
-            rmsd_adapt_gene = np.zeros_like(sse_add); rmsd_adapt_gene[mask] = np.sqrt(sse_adapt[mask] / counts[mask])
-        else:
-            rmsd_adapt_gene = np.array([np.nan]*gN)
-        if use_ridge:
-            rmsd_ridge_gene = np.zeros_like(sse_add); rmsd_ridge_gene[mask] = np.sqrt(sse_ridge[mask] / counts[mask])
-        else:
-            rmsd_ridge_gene = np.array([np.nan]*gN)
+        def fold_rmsd(sse):
+            out = np.zeros(gN); out[mask] = np.sqrt(sse[mask] / counts[mask]); return out
+        rmsd_add_gene = fold_rmsd(sse_add)
+        rmsd_ens_gene = fold_rmsd(sse_ens)
+        rmsd_ridge_gene = fold_rmsd(sse_ridge) if use_ridge else np.full(gN, np.nan)
+        rmsd_adapt_gene = fold_rmsd(sse_adapt) if adaptive_ensemble and use_ridge else np.full(gN, np.nan)
+        rmsd_resid_gene = fold_rmsd(sse_resid) if residual_learner != "none" else np.full(gN, np.nan)
 
         for i_g, gname in enumerate(genes):
             rows_gene.append({
                 "fold": fold_id,
                 "gene": gname,
-                "rmsd_additive": float(rmsd_add_gene[i_g]) if counts[i_g] > 0 else np.nan,
-                "rmsd_ridge": float(rmsd_ridge_gene[i_g]) if counts[i_g] > 0 else np.nan,
-                "rmsd_ensemble": float(rmsd_ens_gene[i_g]) if counts[i_g] > 0 else np.nan,
-                "rmsd_adaptive": float(rmsd_adapt_gene[i_g]) if counts[i_g] > 0 else np.nan,
+                "rmsd_additive": float(rmsd_add_gene[i_g]),
+                "rmsd_ridge": float(rmsd_ridge_gene[i_g]) if use_ridge else np.nan,
+                "rmsd_ensemble": float(rmsd_ens_gene[i_g]),
+                "rmsd_adaptive": float(rmsd_adapt_gene[i_g]) if adaptive_ensemble and use_ridge else np.nan,
+                "rmsd_residual": float(rmsd_resid_gene[i_g]) if residual_learner != "none" else np.nan,
                 "pairs_evaluated": int(counts[i_g])
             })
 
     metrics_per_pair_df = pd.DataFrame(rows_pair)
     metrics_per_gene_df = pd.DataFrame(rows_gene)
 
-    # Console summary
     print("\n=== K-FOLD SUMMARY ===")
     print(f"folds: {k_folds}, pairs evaluated: {len(metrics_per_pair_df)}")
     print(f"Mean RMSD (additive): {metrics_per_pair_df['rmsd_additive'].mean():.6f}")
     if use_ridge:
         print(f"Mean RMSD (ridge):    {metrics_per_pair_df['rmsd_ridge'].mean():.6f}")
-        print(f"Mean RMSD (ensemble): {metrics_per_pair_df['rmsd_ensemble'].mean():.6f}")
-        if adaptive_ensemble:
-            print(f"Mean RMSD (adaptive): {metrics_per_pair_df['rmsd_adaptive'].mean():.6f}")
-    else:
-        print("Ridge disabled (--no_ridge). Ensemble/adaptive equal additive.")
+    print(f"Mean RMSD (ensemble): {metrics_per_pair_df['rmsd_ensemble'].mean():.6f}")
+    if adaptive_ensemble and use_ridge:
+        print(f"Mean RMSD (adaptive): {metrics_per_pair_df['rmsd_adaptive'].mean():.6f}")
+    if residual_learner != "none":
+        print(f"Mean RMSD (residual): {metrics_per_pair_df['rmsd_residual'].mean():.6f}")
 
     return metrics_per_pair_df, metrics_per_gene_df
 
 # ----------------------------
-# Test pairs CSV reader
+# Test pairs CSV reader (robust to header being a valid pair)
 # ----------------------------
 def read_test_pairs_csv(path: str) -> List[str]:
-    """
-    Robustly read test pairs from CSV.
-
-    Accepts:
-      - A single column with NO header, e.g. first line is 'g0001+g0002'
-      - A single column WITH header named 'perturbation'
-      - A single column WITH an accidental "header" that is itself a valid pair
-        (e.g., 'g0037+g0083'), which pandas would otherwise swallow as the column name.
-
-    Returns a list of normalized 'g####+g####|ctrl' strings, preserving order.
-    """
-    # Read once with default header behavior
     df = pd.read_csv(path)
-
-    # Choose the series to read
     if "perturbation" in df.columns:
         series = df["perturbation"].astype(str)
-        header_candidate = None  # normal, explicit header
+        header_candidate = None
     else:
-        # Take first column; remember its *column name* in case it's a valid pair
         first_col_name = str(df.columns[0]) if len(df.columns) > 0 else ""
         series = df.iloc[:, 0].astype(str) if len(df.columns) > 0 else pd.Series([], dtype=str)
         header_candidate = first_col_name.strip()
 
     pairs: List[str] = []
-
-    # If the "column name" itself looks like a valid pair, prepend it.
-    # This fixes the case where pandas swallowed the first data row as a header.
     if header_candidate and PAIR_RE.match(header_candidate):
         pairs.append(header_candidate)
 
-    # Now add the actual column values
     for v in series.tolist():
         v = v.strip()
         if not v:
             continue
-        # validate format; this will raise early if something is malformed
         _ = parse_pair(v)
         pairs.append(v)
-
     return pairs
 
 # ----------------------------
@@ -591,10 +658,15 @@ def main():
     genes = list(df.index)
 
     singles_raw = extract_singles(df)
-    # Winsorize singles if requested
     singles = winsorize_singles(singles_raw, args.winsorize_pct)
 
     if args.mode == "eval":
+        resid_params = dict(
+            max_depth=args.resid_max_depth,
+            learning_rate=args.resid_learning_rate,
+            max_iter=args.resid_max_iter,
+            min_samples_leaf=args.resid_min_samples_leaf,
+        )
         metrics_pair_df, metrics_gene_df = eval_kfold(
             df=df,
             singles_in=singles,
@@ -610,14 +682,16 @@ def main():
             scaled_additive_mode=args.scaled_additive,
             alpha_clip=float(args.alpha_clip),
             adaptive_ensemble=bool(args.adaptive_ensemble),
+            residual_learner=args.residual_learner,
+            resid_on=args.resid_on,
+            resid_params=resid_params
         )
-        # write long-form logs
         metrics_pair_df.to_csv(args.metrics_per_pair_csv, index=False)
         metrics_gene_df.to_csv(args.metrics_per_gene_csv, index=False)
         print(f"\nWrote per-pair metrics to   {args.metrics_per_pair_csv}")
         print(f"Wrote per-gene metrics to   {args.metrics_per_gene_csv}")
 
-        # build compact summary table for --metrics_csv
+        # summary CSV
         summary_rows = []
         overall = {
             "scope": "overall",
@@ -626,6 +700,7 @@ def main():
             "mean_rmsd_ridge": metrics_pair_df["rmsd_ridge"].mean() if not args.no_ridge else np.nan,
             "mean_rmsd_ensemble": metrics_pair_df["rmsd_ensemble"].mean(),
             "mean_rmsd_adaptive": metrics_pair_df["rmsd_adaptive"].mean() if (not args.no_ridge and args.adaptive_ensemble) else np.nan,
+            "mean_rmsd_residual": metrics_pair_df["rmsd_residual"].mean() if args.residual_learner != "none" else np.nan,
             "pairs": len(metrics_pair_df)
         }
         summary_rows.append(overall)
@@ -638,44 +713,32 @@ def main():
                 "mean_rmsd_ridge": sub["rmsd_ridge"].mean() if not args.no_ridge else np.nan,
                 "mean_rmsd_ensemble": sub["rmsd_ensemble"].mean(),
                 "mean_rmsd_adaptive": sub["rmsd_adaptive"].mean() if (not args.no_ridge and args.adaptive_ensemble) else np.nan,
+                "mean_rmsd_residual": sub["rmsd_residual"].mean() if args.residual_learner != "none" else np.nan,
                 "pairs": len(sub)
             })
         pd.DataFrame(summary_rows).to_csv(args.metrics_csv, index=False)
         print(f"Wrote summary metrics to    {args.metrics_csv}")
-
-        recap = {
-            "overall_add": float(overall["mean_rmsd_additive"]),
-            "overall_ridge": None if args.no_ridge else float(overall["mean_rmsd_ridge"]),
-            "overall_ens": float(overall["mean_rmsd_ensemble"]),
-            "overall_adapt": None if (args.no_ridge or not args.adaptive_ensemble) else float(overall["mean_rmsd_adaptive"])
-        }
-        print("\nOVERALL:", recap)
-
-    else:  # predict
-        if not args.test_pairs:
-            raise ValueError("In 'predict' mode, --test_pairs (CSV) is required.")
+    else:
+        # predict
         test_pairs_list = read_test_pairs_csv(args.test_pairs)
-
-        # Control (robust if requested)
+        print(f"[predict] loaded pairs: {len(test_pairs_list)}")
         ctrl_vec = find_ctrl_vector(df, singles, args.robust_ctrl, float(args.trim_pct))
-
-        # Fit ridge on ALL usable doubles (max training signal)
         expanded = (args.features == "expanded")
-        if args.no_ridge:
-            coefs = None
-        else:
-            coefs = fit_per_gene_ridge(df, singles, ctrl_vec, alphas, train_pair_indices=None,
-                                       expanded_features=expanded)
 
-        # Fit scaled-additive alpha on all doubles (optional)
+        # ridge coefs on all doubles if enabled
+        coefs = None
+        if not args.no_ridge:
+            coefs = fit_per_gene_ridge(df, singles, ctrl_vec, [float(x) for x in args.ridge_alphas.split(",") if x],
+                                       train_pair_indices=None, expanded_features=expanded)
+
+        # scaled-additive alpha on all doubles (optional)
         alpha_vec = None
         if args.scaled_additive != "none":
             y_add_cols, y_true_cols = [], []
             for (a,b,y_true) in build_training_pairs(df):
                 y_add_cols.append(additive_prediction(singles, ctrl_vec, (a,b), alpha_vec=None))
                 y_true_cols.append(y_true)
-            y_add_M = np.stack(y_add_cols, axis=1)
-            y_true_M = np.stack(y_true_cols, axis=1)
+            y_add_M = np.stack(y_add_cols, axis=1); y_true_M = np.stack(y_true_cols, axis=1)
             if args.scaled_additive == "global":
                 alpha_vec = fit_scaled_additive_alpha(y_add_M.flatten(), y_true_M.flatten(),
                                                       np.tile(ctrl_vec, y_add_M.shape[1]),
@@ -685,18 +748,22 @@ def main():
                                                       np.mean(y_true_M, axis=1),
                                                       ctrl_vec, mode="per_gene", alpha_clip=float(args.alpha_clip))
 
-        # Adaptive ensemble weights on all doubles (optional)
-        w_adapt = None
-        if args.adaptive_ensemble and not args.no_ridge:
-            y_add_cols, y_ridge_cols, y_true_cols = [], [], []
-            for (a,b,y_true) in build_training_pairs(df):
-                y_add_cols.append(additive_prediction(singles, ctrl_vec, (a,b), alpha_vec))
-                y_ridge_cols.append(ridge_prediction_for_pair(singles, ctrl_vec, (a,b), coefs, expanded))
-                y_true_cols.append(y_true)
-            y_add_M = np.stack(y_add_cols, axis=1)
-            y_ridge_M = np.stack(y_ridge_cols, axis=1)
-            y_true_M = np.stack(y_true_cols, axis=1)
-            w_adapt = fit_per_gene_adaptive_weights(y_add_M, y_ridge_M, y_true_M)
+        # residual learner on ALL doubles (optional)
+        scalers = models = None
+        if args.residual_learner != "none":
+            resid_params = dict(
+                max_depth=args.resid_max_depth,
+                learning_rate=args.resid_learning_rate,
+                max_iter=args.resid_max_iter,
+                min_samples_leaf=args.resid_min_samples_leaf,
+            )
+            base_on = args.resid_on
+            scalers, models = train_residual_models(
+                df, singles, ctrl_vec, base_on=base_on, coefs=coefs,
+                expanded_features=expanded, alphas=alphas,
+                train_pair_indices=list(range(len(build_training_pairs(df)))),
+                resid_params=resid_params, random_state=args.seed
+            )
 
         # Produce predictions
         final_preds: Dict[str, np.ndarray] = {}
@@ -704,20 +771,27 @@ def main():
             a, b = parse_pair(p)
             y_add = additive_prediction(singles, ctrl_vec, (a, b), alpha_vec)
             if args.no_ridge:
-                y_final = y_add
+                y_base = y_add
             else:
                 y_ridge = ridge_prediction_for_pair(singles, ctrl_vec, (a, b), coefs, expanded)
-                if args.adaptive_ensemble and w_adapt is not None:
-                    y_final = np.clip((1.0 - w_adapt) * y_add + w_adapt * y_ridge, 0.0, None)
-                else:
-                    w = float(args.ensemble_weight)
-                    y_final = np.clip((1.0 - w) * y_add + w * y_ridge, 0.0, None)
+                w = float(args.ensemble_weight)
+                y_base = np.clip((1.0 - w) * y_add + w * y_ridge, 0.0, None)
+
+            # optional residual correction
+            if args.residual_learner != "none" and models is not None:
+                y_final = predict_with_residual(singles, ctrl_vec, (a,b),
+                                                y_base if args.resid_on == "ensemble" else y_add,
+                                                expanded, scalers, models)
+            else:
+                y_final = y_base
+
             final_preds[p] = y_final
 
         out_df = make_output_frame(genes, test_pairs_list, final_preds, args.template_csv)
         if out_df.isnull().any().any():
             raise RuntimeError("Output contains NaNs; please check inputs.")
         out_df = out_df[["gene", "perturbation", "expression"]].astype({"gene":str,"perturbation":str,"expression":float})
+        os.makedirs(os.path.dirname(args.out_csv), exist_ok=True)
         out_df.to_csv(args.out_csv, index=False)
         print(f"Wrote {len(out_df)} rows to {args.out_csv}")
 
